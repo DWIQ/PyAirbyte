@@ -14,7 +14,7 @@ from airbyte._message_iterators import AirbyteMessageIterator
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Iterator
 
-    from airbyte.sources.registry import ConnectorMetadata
+    from airbyte.registry import ConnectorMetadata
 
 
 _LATEST_VERSION = "latest"
@@ -43,6 +43,11 @@ def _pump_input(
         try:
             pipe.writelines(message.model_dump_json() + "\n" for message in messages)
             pipe.flush()  # Ensure data is sent immediately
+        except (BrokenPipeError, OSError) as ex:
+            if isinstance(ex, BrokenPipeError):
+                pass  # Expected during graceful shutdown
+            else:
+                exception_holder.set_exception(ex)
         except Exception as ex:
             exception_holder.set_exception(ex)
 
@@ -62,16 +67,24 @@ def _stream_from_subprocess(
     *,
     stdin: IO[str] | AirbyteMessageIterator | None = None,
     log_file: IO[str] | None = None,
+    suppress_stderr: bool = False,
 ) -> Generator[Iterable[str], None, None]:
-    """Stream lines from a subprocess."""
+    """Stream lines from a subprocess.
+
+    When stdin is an AirbyteMessageIterator, input is pumped to the subprocess
+    in a separate thread while output is read concurrently. This avoids a
+    potential deadlock where the subprocess blocks on stdout (buffer full)
+    while we're waiting for input to finish before reading stdout.
+    """
     input_thread: Thread | None = None
     exception_holder = ExceptionHolder()
     if isinstance(stdin, AirbyteMessageIterator):
+        stderr_target = subprocess.DEVNULL if suppress_stderr else log_file
         process = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=log_file,
+            stderr=stderr_target,
             universal_newlines=True,
             encoding="utf-8",
         )
@@ -82,24 +95,20 @@ def _stream_from_subprocess(
                 stdin,
                 exception_holder,
             ),
+            daemon=True,  # Prevent blocking interpreter shutdown if thread gets stuck
         )
         input_thread.start()
-        input_thread.join()  # Ensure the input thread has finished
-
-        # Don't bother raising broken pipe errors, as they only
-        # indicate that a subprocess has terminated early.
-        if exception_holder.exception and not isinstance(
-            exception_holder.exception, BrokenPipeError
-        ):
-            raise exception_holder.exception
+        # Don't join here - let input and output happen concurrently to avoid deadlock.
+        # The input thread will be joined in the finally block after reading is done.
 
     else:
         # stdin is None or a file-like object
+        stderr_target = subprocess.DEVNULL if suppress_stderr else log_file
         process = subprocess.Popen(
             args,
             stdin=stdin,
             stdout=subprocess.PIPE,
-            stderr=log_file,
+            stderr=stderr_target,
             universal_newlines=True,
             encoding="utf-8",
         )
@@ -117,34 +126,47 @@ def _stream_from_subprocess(
         yield _stream_from_file(process.stdout)
         process.wait()
     finally:
-        # Close the stdout stream
-        if process.stdout:
-            process.stdout.close()
+        try:
+            # Terminate the process if it is still running
+            if process.poll() is None:  # Check if the process is still running
+                process.terminate()
+                try:
+                    # Wait for a short period to allow process to terminate gracefully
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    # If the process does not terminate within the timeout, force kill it
+                    process.kill()
 
-        # Terminate the process if it is still running
-        if process.poll() is None:  # Check if the process is still running
-            process.terminate()
-            try:
-                # Wait for a short period to allow process to terminate gracefully
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                # If the process does not terminate within the timeout, force kill it
-                process.kill()
+            # Join the input thread if it exists (after process termination so stdin closes)
+            if input_thread is not None:
+                input_thread.join(timeout=10)
 
-        # Now, the process is either terminated or killed. Check the exit code.
-        exit_code = process.wait()
+            # Now, the process is either terminated or killed. Check the exit code.
+            exit_code = process.wait()
 
-        # If the exit code is not 0 or -15 (SIGTERM), raise an exception
-        if exit_code not in {0, -15}:
-            raise exc.AirbyteSubprocessFailedError(
-                run_args=args,
-                exit_code=exit_code,
-                original_exception=(
-                    exception_holder.exception
-                    if not isinstance(exception_holder.exception, BrokenPipeError)
-                    else None
-                ),
-            )
+            # If the exit code is not 0 or -15 (SIGTERM), raise AirbyteSubprocessFailedError.
+            # Include input thread exception as original_exception if present.
+            if exit_code not in {0, -15}:
+                raise exc.AirbyteSubprocessFailedError(
+                    run_args=args,
+                    exit_code=exit_code,
+                    original_exception=(
+                        exception_holder.exception
+                        if exception_holder.exception
+                        and not isinstance(exception_holder.exception, BrokenPipeError)
+                        else None
+                    ),
+                )
+
+            # Only raise input thread exception if exit code was OK (ignore BrokenPipeError)
+            if exception_holder.exception and not isinstance(
+                exception_holder.exception, BrokenPipeError
+            ):
+                raise exception_holder.exception
+        finally:
+            # Close the stdout stream
+            if process.stdout:
+                process.stdout.close()
 
 
 class Executor(ABC):
@@ -198,15 +220,18 @@ class Executor(ABC):
         args: list[str],
         *,
         stdin: IO[str] | AirbyteMessageIterator | None = None,
+        suppress_stderr: bool = False,
     ) -> Iterator[str]:
         """Execute a command and return an iterator of STDOUT lines.
 
         If stdin is provided, it will be passed to the subprocess as STDIN.
+        If suppress_stderr is True, stderr output will be suppressed to reduce noise.
         """
         mapped_args = self.map_cli_args(args)
         with _stream_from_subprocess(
             [*self._cli, *mapped_args],
             stdin=stdin,
+            suppress_stderr=suppress_stderr,
         ) as stream_lines:
             yield from stream_lines
 

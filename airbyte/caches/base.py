@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, ClassVar, Literal, final
 
@@ -10,7 +11,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
 from pydantic import Field, PrivateAttr
+from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import text
+from typing_extensions import Self
 
 from airbyte_protocol.models import ConfiguredAirbyteCatalog
 
@@ -27,6 +30,7 @@ from airbyte.shared.state_writers import StdOutStateWriter
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from types import TracebackType
 
     from airbyte._message_iterators import AirbyteMessageIterator
     from airbyte.caches._state_backend_base import StateBackendBase
@@ -38,7 +42,7 @@ if TYPE_CHECKING:
     from airbyte.strategies import WriteStrategy
 
 
-class CacheBase(SqlConfig, AirbyteWriterInterface):
+class CacheBase(SqlConfig, AirbyteWriterInterface):  # noqa: PLR0904
     """Base configuration for a cache.
 
     Caches inherit from the matching `SqlConfig` class, which provides the SQL config settings
@@ -90,11 +94,11 @@ class CacheBase(SqlConfig, AirbyteWriterInterface):
 
         # Initialize the catalog and state backends
         self._catalog_backend = SqlCatalogBackend(
-            engine=self.get_sql_engine(),
+            sql_config=self,
             table_prefix=self.table_prefix or "",
         )
         self._state_backend = SqlStateBackend(
-            engine=self.get_sql_engine(),
+            sql_config=self,
             table_prefix=self.table_prefix or "",
         )
 
@@ -106,6 +110,49 @@ class CacheBase(SqlConfig, AirbyteWriterInterface):
             temp_dir=self.cache_dir,
             temp_file_cleanup=self.cleanup,
         )
+
+    def close(self) -> None:
+        """Close all database connections and dispose of connection pools.
+
+        This method ensures that all SQLAlchemy engines created by this cache
+        and its processors are properly disposed, releasing all database connections.
+        This is especially important for file-based databases like DuckDB, which
+        lock the database file until all connections are closed.
+
+        This method is idempotent and can be called multiple times safely.
+
+        Raises:
+            Exception: If any engine disposal fails, the exception will propagate
+                to the caller. This ensures callers are aware of cleanup failures.
+        """
+        if self._read_processor is not None:
+            self._read_processor.sql_config.dispose_engine()
+
+        if self._catalog_backend is not None:
+            self._catalog_backend._sql_config.dispose_engine()  # noqa: SLF001
+
+        if self._state_backend is not None:
+            self._state_backend._sql_config.dispose_engine()  # noqa: SLF001
+
+        self.dispose_engine()
+
+    def __enter__(self) -> Self:
+        """Enter context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit context manager and clean up resources."""
+        self.close()
+
+    def __del__(self) -> None:
+        """Clean up resources when cache is garbage collected."""
+        with contextlib.suppress(Exception):
+            self.close()
 
     @property
     def config_hash(self) -> str | None:
@@ -144,6 +191,54 @@ class CacheBase(SqlConfig, AirbyteWriterInterface):
     def processor(self) -> SqlProcessorBase:
         """Return the SQL processor instance."""
         return self._read_processor
+
+    def run_sql_query(
+        self,
+        sql_query: str,
+        *,
+        max_records: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run a SQL query against the cache and return results as a list of dictionaries.
+
+        This method is designed for single DML statements like SELECT, SHOW, or DESCRIBE.
+        For DDL statements or multiple statements, use the processor directly.
+
+        Args:
+            sql_query: The SQL query to execute
+            max_records: Maximum number of records to return. If None, returns all records.
+
+        Returns:
+            List of dictionaries representing the query results
+        """
+        # Execute the SQL within a connection context to ensure the connection stays open
+        # while we fetch the results
+        sql_text = text(sql_query) if isinstance(sql_query, str) else sql_query
+
+        with self.processor.get_sql_connection() as conn:
+            try:
+                result = conn.execute(sql_text)
+            except (
+                sqlalchemy_exc.ProgrammingError,
+                sqlalchemy_exc.SQLAlchemyError,
+            ) as ex:
+                msg = f"Error when executing SQL:\n{sql_query}\n{type(ex).__name__}{ex!s}"
+                raise RuntimeError(msg) from ex
+
+            # Convert the result to a list of dictionaries while connection is still open
+            if result.returns_rows:
+                # Get column names
+                columns = list(result.keys()) if result.keys() else []
+
+                # Fetch rows efficiently based on limit
+                if max_records is not None:
+                    rows = result.fetchmany(max_records)
+                else:
+                    rows = result.fetchall()
+
+                return [dict(zip(columns, row, strict=True)) for row in rows]
+
+            # For non-SELECT queries (INSERT, UPDATE, DELETE, etc.)
+            return []
 
     def get_record_processor(
         self,
@@ -360,7 +455,7 @@ class CacheBase(SqlConfig, AirbyteWriterInterface):
             state_writer=state_writer,
         )
         cache_processor.process_airbyte_messages(
-            messages=stdin,
+            messages=stdin,  # pyrefly: ignore[bad-argument-type]
             write_strategy=write_strategy,
             progress_tracker=progress_tracker,
         )

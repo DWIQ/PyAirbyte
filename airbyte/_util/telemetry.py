@@ -109,8 +109,9 @@ def _setup_analytics() -> str | bool:
 
     if _ANALYTICS_FILE.exists():
         analytics_text = _ANALYTICS_FILE.read_text()
+        analytics: dict | None = None
         try:
-            analytics: dict = yaml.safe_load(analytics_text)
+            analytics = yaml.safe_load(analytics_text)
         except Exception as ex:
             issues += f"File appears corrupted. Error was: {ex!s}"
 
@@ -169,6 +170,7 @@ class EventState(str, Enum):
     STARTED = "started"
     FAILED = "failed"
     SUCCEEDED = "succeeded"
+    CANCELED = "canceled"
 
 
 class EventType(str, Enum):
@@ -183,6 +185,7 @@ def get_env_flags() -> dict[str, Any]:
     flags: dict[str, bool | str] = {
         "CI": meta.is_ci(),
         "LANGCHAIN": meta.is_langchain(),
+        "MCP": meta.is_mcp_mode(),
         "NOTEBOOK_RUNTIME": (
             "GOOGLE_COLAB"
             if meta.is_colab()
@@ -249,7 +252,7 @@ def send_telemetry(
                 "anonymousId": _get_analytics_id(),
                 "event": event_type,
                 "properties": payload_props,
-                "timestamp": datetime.datetime.utcnow().isoformat(),  # noqa: DTZ003
+                "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
             },
         )
 

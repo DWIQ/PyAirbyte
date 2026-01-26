@@ -4,11 +4,60 @@
 from __future__ import annotations
 
 import warnings
+from contextlib import suppress
 from typing import Any, cast
 
 from airbyte import exceptions as exc
+from airbyte.constants import SECRETS_HYDRATION_PREFIX
 from airbyte.secrets.base import SecretManager, SecretSourceEnum, SecretString
 from airbyte.secrets.config import _get_secret_sources
+
+
+def is_secret_available(
+    secret_name: str,
+) -> bool:
+    """Check if a secret is available in any of the configured secret sources.
+
+    This function checks all available secret sources for the given secret name.
+    If the secret is found in any source, it returns `True`; otherwise, it returns `False`.
+    """
+    try:
+        _ = get_secret(secret_name, allow_prompt=False)
+    except exc.PyAirbyteSecretNotFoundError:
+        return False
+    else:
+        # If no exception was raised, the secret was found.
+        return True
+
+
+def try_get_secret(
+    secret_name: str,
+    /,
+    default: str | SecretString | None = None,
+    sources: list[SecretManager | SecretSourceEnum] | None = None,
+    **kwargs: dict[str, Any],
+) -> SecretString | None:
+    """Try to get a secret from the environment, failing gracefully.
+
+    This function attempts to retrieve a secret from the configured secret sources.
+    If the secret is found, it returns the secret value; otherwise, it returns the
+    default value or None.
+
+    This function will not prompt the user for input if the secret is not found.
+
+    Raises:
+        PyAirbyteInputError: If an invalid source name is provided in the `sources` argument.
+    """
+    with suppress(exc.PyAirbyteSecretNotFoundError):
+        return get_secret(
+            secret_name,
+            sources=sources,
+            allow_prompt=False,
+            default=default,
+            **kwargs,
+        )
+
+    return None
 
 
 def get_secret(
@@ -16,6 +65,7 @@ def get_secret(
     /,
     *,
     sources: list[SecretManager | SecretSourceEnum] | None = None,
+    default: str | SecretString | None = None,
     allow_prompt: bool = True,
     **kwargs: dict[str, Any],
 ) -> SecretString:
@@ -27,7 +77,17 @@ def get_secret(
 
     If `allow_prompt` is `True` or if SecretSourceEnum.PROMPT is declared in the `source` arg, then
     the user will be prompted to enter the secret if it is not found in any of the other sources.
+
+    Raises:
+        PyAirbyteSecretNotFoundError: If the secret is not found in any of the configured sources,
+            and if no default value is provided.
+        PyAirbyteInputError: If an invalid source name is provided in the `sources` argument.
     """
+    if secret_name.startswith(SECRETS_HYDRATION_PREFIX):
+        # If the secret name starts with the hydration prefix, we assume it's a secret reference.
+        # We strip the prefix and get the actual secret name.
+        secret_name = secret_name.removeprefix(SECRETS_HYDRATION_PREFIX).lstrip()
+
     if "source" in kwargs:
         warnings.warn(
             message="The `source` argument is deprecated. Use the `sources` argument instead.",
@@ -79,6 +139,9 @@ def get_secret(
         val = secret_mgr.get_secret(secret_name)
         if val:
             return SecretString(val)
+
+    if default:
+        return SecretString(default)
 
     raise exc.PyAirbyteSecretNotFoundError(
         secret_name=secret_name,

@@ -4,10 +4,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from pytz import utc
 from sqlalchemy import Column, DateTime, PrimaryKeyConstraint, String, and_
 from sqlalchemy.orm import Session, declarative_base
 
@@ -25,8 +24,7 @@ from airbyte.shared.state_writers import StateWriterBase
 
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine import Engine
-
+    from airbyte.shared.sql_processor import SqlConfig
     from airbyte.shared.state_providers import StateProviderBase
 
 
@@ -60,7 +58,9 @@ class CacheStreamStateModel(SqlAlchemyModel):  # type: ignore[misc]
     """The JSON string representation of the state message."""
 
     last_updated = Column(
-        DateTime(timezone=True), onupdate=datetime.now(utc), default=datetime.now(utc)
+        DateTime(timezone=True),
+        onupdate=datetime.now(timezone.utc),
+        default=datetime.now(timezone.utc),
     )
     """The last time the state was updated."""
 
@@ -90,7 +90,9 @@ class DestinationStreamStateModel(SqlAlchemyModel):  # type: ignore[misc]
     """The JSON string representation of the state message."""
 
     last_updated = Column(
-        DateTime(timezone=True), onupdate=datetime.now(utc), default=datetime.now(utc)
+        DateTime(timezone=True),
+        onupdate=datetime.now(timezone.utc),
+        default=datetime.now(timezone.utc),
     )
     """The last time the state was updated."""
 
@@ -136,7 +138,7 @@ class SqlStateWriter(StateWriterBase):
 
         self._state_backend._ensure_internal_tables()  # noqa: SLF001  # Non-public member access
         table_prefix = self._state_backend._table_prefix  # noqa: SLF001
-        engine = self._state_backend._engine  # noqa: SLF001
+        engine = self._state_backend._sql_config.get_sql_engine()  # noqa: SLF001
 
         # Calculate the new state model to write.
         new_state = (
@@ -187,17 +189,17 @@ class SqlStateBackend(StateBackendBase):
 
     def __init__(
         self,
-        engine: Engine,
+        sql_config: SqlConfig,
         table_prefix: str = "",
     ) -> None:
         """Initialize the state manager with a static catalog state."""
-        self._engine: Engine = engine
+        self._sql_config = sql_config
         self._table_prefix = table_prefix
         super().__init__()
 
     def _ensure_internal_tables(self) -> None:
         """Ensure the internal tables exist in the SQL database."""
-        engine = self._engine
+        engine = self._sql_config.get_sql_engine()
         SqlAlchemyModel.metadata.create_all(engine)  # type: ignore[attr-defined]
 
     def get_state_provider(
@@ -223,7 +225,7 @@ class SqlStateBackend(StateBackendBase):
         else:
             stream_state_model = CacheStreamStateModel
 
-        engine = self._engine
+        engine = self._sql_config.get_sql_engine()
         with Session(engine) as session:
             query = session.query(stream_state_model).filter(
                 stream_state_model.source_name == source_name

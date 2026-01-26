@@ -125,6 +125,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from airbyte import registry
 from airbyte.caches.bigquery import BigQueryCache
 from airbyte.caches.duckdb import DuckDBCache
 from airbyte.caches.util import get_colab_cache, get_default_cache, new_local_cache
@@ -132,11 +133,10 @@ from airbyte.datasets import CachedDataset
 from airbyte.destinations.base import Destination
 from airbyte.destinations.util import get_destination
 from airbyte.records import StreamRecord
+from airbyte.registry import get_available_connectors
 from airbyte.results import ReadResult, WriteResult
 from airbyte.secrets import SecretSourceEnum, get_secret
-from airbyte.sources import registry
 from airbyte.sources.base import Source
-from airbyte.sources.registry import get_available_connectors
 from airbyte.sources.util import get_source
 
 
@@ -155,6 +155,7 @@ if TYPE_CHECKING:
         exceptions,  # noqa: ICN001  # No 'exc' alias for top-level module
         experimental,
         logs,
+        mcp,
         records,
         results,
         secrets,
@@ -175,6 +176,7 @@ __all__ = [
     "exceptions",
     "experimental",
     "logs",
+    "mcp",
     "records",
     "registry",
     "results",

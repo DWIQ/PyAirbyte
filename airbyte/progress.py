@@ -28,6 +28,7 @@ from contextlib import suppress
 from enum import Enum, auto
 from typing import IO, TYPE_CHECKING, Any, Literal, cast
 
+from rich.console import Console
 from rich.errors import LiveError
 from rich.live import Live as RichLive
 from rich.markdown import Markdown as RichMarkdown
@@ -103,6 +104,9 @@ class ProgressStyle(Enum):
 
 MAX_UPDATE_FREQUENCY = 5_000
 """The max number of records to read before updating the progress bar."""
+
+TIME_TO_FIRST_RECORD_THRESHOLD_SECONDS = 10
+"""Threshold for time_to_first_record above which adjusted metrics are calculated."""
 
 
 def _to_time_str(timestamp: float) -> str:
@@ -190,6 +194,7 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
         # Stream reads
         self.stream_read_counts: dict[str, int] = defaultdict(int)
         self.stream_read_start_times: dict[str, float] = {}
+        self.stream_first_record_times: dict[str, float] = {}
         self.stream_read_end_times: dict[str, float] = {}
         self.stream_bytes_read: dict[str, int] = defaultdict(int)
 
@@ -211,6 +216,7 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
 
         # Progress bar properties
         self._last_update_time: float | None = None
+        self._stderr_console: Console | None = None
         self._rich_view: RichLive | None = None
 
         self.reset_progress_style(style)
@@ -276,6 +282,9 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
                     if message.record.stream not in self.stream_read_start_times:
                         self.log_stream_start(stream_name=message.record.stream)
 
+                    if message.record.stream not in self.stream_first_record_times:
+                        self.stream_first_record_times[message.record.stream] = time.time()
+
             elif message.trace and message.trace.stream_status:
                 if message.trace.stream_status.status is AirbyteStreamStatus.STARTED:
                     self.log_stream_start(
@@ -312,8 +321,11 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
 
         update_period = 1  # Reset the update period to 1 before start.
 
-        for count, message in enumerate(messages, start=1):
-            yield message  # Yield the message immediately.
+        for count, message in enumerate(  # pyrefly: ignore[bad-assignment]
+            messages,  # pyrefly: ignore[bad-argument-type]
+            start=1,
+        ):
+            yield message  # pyrefly: ignore[invalid-yield]
             if isinstance(message, str):
                 # This is a string message, not an AirbyteMessage.
                 # For now at least, we don't need to pay the cost of parsing it.
@@ -419,6 +431,22 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
             event_type=EventType.SYNC,
         )
 
+    def _log_sync_cancel(self) -> None:
+        print(
+            f"Canceled `{self.job_description}` sync at `{ab_datetime_now().strftime('%H:%M:%S')}`."
+        )
+        self._send_telemetry(
+            state=EventState.CANCELED,
+            event_type=EventType.SYNC,
+        )
+
+    def _log_stream_read_start(self, stream_name: str) -> None:
+        print(
+            f"Read started on stream `{stream_name}` at "
+            f"`{ab_datetime_now().strftime('%H:%M:%S')}`..."
+        )
+        self.stream_read_start_times[stream_name] = time.time()
+
     def log_stream_start(self, stream_name: str) -> None:
         """Log that a stream has started reading."""
         if stream_name not in self.stream_read_start_times:
@@ -452,9 +480,36 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
 
         return job_info
 
+    def _calculate_adjusted_metrics(
+        self,
+        stream_name: str,
+        count: int,
+        time_to_first_record: float,
+        mb_read: float,
+    ) -> dict[str, float]:
+        """Calculate adjusted performance metrics when time_to_first_record exceeds threshold."""
+        adjusted_metrics: dict[str, float] = {}
+        if (
+            time_to_first_record > TIME_TO_FIRST_RECORD_THRESHOLD_SECONDS
+            and stream_name in self.stream_first_record_times
+            and stream_name in self.stream_read_end_times
+        ):
+            adjusted_duration = (
+                self.stream_read_end_times[stream_name]
+                - self.stream_first_record_times[stream_name]
+            )
+            if adjusted_duration > 0:
+                adjusted_metrics["records_per_second_adjusted"] = round(
+                    count / adjusted_duration, 4
+                )
+                if self.bytes_tracking_enabled:
+                    adjusted_metrics["mb_per_second_adjusted"] = round(
+                        mb_read / adjusted_duration, 4
+                    )
+        return adjusted_metrics
+
     def _log_read_metrics(self) -> None:
         """Log read performance metrics."""
-        # Source performance metrics
         if not self.total_records_read or not self._file_logger:
             return
 
@@ -484,6 +539,18 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
                 "read_start_time": self.stream_read_start_times.get(stream_name),
                 "read_end_time": self.stream_read_end_times.get(stream_name),
             }
+
+            time_to_first_record = None
+            if (
+                stream_name in self.stream_first_record_times
+                and stream_name in self.stream_read_start_times
+            ):
+                time_to_first_record = (
+                    self.stream_first_record_times[stream_name]
+                    - self.stream_read_start_times[stream_name]
+                )
+                stream_metrics[stream_name]["time_to_first_record"] = time_to_first_record
+
             if (
                 stream_name in self.stream_read_end_times
                 and stream_name in self.stream_read_start_times
@@ -503,15 +570,22 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
                         ),
                         4,
                     )
+                    mb_read = 0.0
                     if self.bytes_tracking_enabled:
                         mb_read = self.stream_bytes_read[stream_name] / 1_000_000
                         stream_metrics[stream_name]["mb_read"] = mb_read
                         stream_metrics[stream_name]["mb_per_second"] = round(mb_read / duration, 4)
 
+                    if time_to_first_record is not None:
+                        adjusted_metrics = self._calculate_adjusted_metrics(
+                            stream_name, count, time_to_first_record, mb_read
+                        )
+                        stream_metrics[stream_name].update(adjusted_metrics)
+
         perf_metrics["stream_metrics"] = stream_metrics
         log_dict["performance_metrics"] = perf_metrics
 
-        self._file_logger.info(json.dumps(log_dict))
+        self._file_logger.info(json.dumps(log_dict))  # pyrefly: ignore[missing-attribute]
 
         perf_logger: BoundLogger = logs.get_global_stats_logger()
         perf_logger.info(**log_dict)
@@ -536,9 +610,17 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
 
         self._update_display(force_refresh=True)
         self._stop_rich_view()
-        self._print_info_message(
+        streams = list(self.stream_read_start_times.keys())
+        if not streams:
+            streams_str = ""
+        elif len(streams) == 1:
+            streams_str = f" (`{streams[0]}` stream)"
+        else:
+            streams_str = f" ({len(streams)} streams)"
+
+        print(
             f"Completed `{self.job_description}` sync at "
-            f"`{ab_datetime_now().strftime('%H:%M:%S')}`."
+            f"`{ab_datetime_now().strftime('%H:%M:%S')}`{streams_str}."
         )
         self._log_read_metrics()
         self._send_telemetry(
@@ -622,9 +704,13 @@ class ProgressTracker:  # noqa: PLR0904  # Too many public methods
         """
         if self.style == ProgressStyle.RICH and not self._rich_view:
             try:
+                if self._stderr_console is None:
+                    self._stderr_console = Console(stderr=True)
+
                 self._rich_view = RichLive(
                     auto_refresh=True,
                     refresh_per_second=DEFAULT_REFRESHES_PER_SECOND,
+                    console=self._stderr_console,
                 )
                 self._rich_view.start()
             except Exception:

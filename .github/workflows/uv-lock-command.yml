@@ -1,4 +1,4 @@
-name: On-Demand Poetry Lock
+name: On-Demand UV Lock
 
 on:
   workflow_dispatch:
@@ -12,12 +12,17 @@ on:
         type: string
         required: false
 
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
 env:
   AIRBYTE_ANALYTICS_ID: ${{ vars.AIRBYTE_ANALYTICS_ID }}
 
 jobs:
-  poetry-lock-on-demand:
-    name: On-Demand Poetry Lock
+  uv-lock-on-demand:
+    name: On-Demand UV Lock
     strategy:
       matrix:
         python-version: [
@@ -32,76 +37,70 @@ jobs:
     steps:
 
     # Custom steps to fetch the PR and checkout the code:
+    - name: Authenticate as GitHub App
+      uses: actions/create-github-app-token@v2
+      id: get-app-token
+      with:
+        owner: "airbytehq"
+        repositories: "PyAirbyte"
+        app-id: ${{ secrets.OCTAVIA_BOT_APP_ID }}
+        private-key: ${{ secrets.OCTAVIA_BOT_PRIVATE_KEY }}
     - name: Checkout Airbyte
-      uses: actions/checkout@v4
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       with:
         # Important that this is set so that CI checks are triggered again
         # Without this we would be forever waiting on required checks to pass
-        token: ${{ secrets.GH_PAT_APPROVINGTON_OCTAVIA }}
+        token: ${{ steps.get-app-token.outputs.token }}
 
     - name: Checkout PR (${{ github.event.inputs.pr }})
       uses: dawidd6/action-checkout-pr@v1
       with:
         pr: ${{ github.event.inputs.pr }}
 
-    - name: Check for blank or missing poetry.lock
+    - name: Check for blank or missing uv.lock
       run: |
-        if [ ! -s "poetry.lock" ]; then
-          echo "poetry.lock missing or blank. Fetching from main branch..."
+        if [ ! -s "uv.lock" ]; then
+          echo "uv.lock missing or blank. Fetching from main branch..."
           git fetch origin main
-          git checkout origin/main -- poetry.lock
+          git checkout origin/main -- uv.lock
           echo "Lock file restored from main."
         else
-          echo "poetry.lock found. Proceeding."
+          echo "uv.lock found. Proceeding."
         fi
 
-    - name: Get PR info
-      id: pr-info
-      run: |
-        PR_JSON=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.inputs.pr }})
-        echo "::set-output name=repo::$(echo "$PR_JSON" | jq -r .head.repo.full_name)"
-        echo "::set-output name=branch::$(echo "$PR_JSON" | jq -r .head.ref)"
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      shell: bash
-
-    - name: Create URL to the run output
+    - name: Resolve workflow variables
       id: vars
-      run: echo "run-url=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> $GITHUB_OUTPUT
+      uses: aaronsteers/resolve-ci-vars-action@v0
 
     - name: Append comment with job run link
       id: first-comment-action
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@v5
       with:
         comment-id: ${{ github.event.inputs.comment-id }}
         issue-number: ${{ github.event.inputs.pr }}
         body: |
 
-          > `poetry lock` job started... [Check job output.][1]
+          > `uv lock` job started... [Check job output.][1]
 
           [1]: ${{ steps.vars.outputs.run-url }}
 
-    - name: Set up Poetry
-      uses: Gr1N/setup-poetry@v9
+    - name: Install uv
+      uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904 # v7
       with:
-        poetry-version: "2.0.1"
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
+        version: "latest"
         python-version: ${{ matrix.python-version }}
-        cache: 'poetry'
 
-    # Run `poetry lock`
+    # Run `uv lock`
 
-    - name: Run `poetry lock`
-      run: poetry lock
+    - name: Run `uv lock`
+      run: uv lock
 
     # Check for changes in git
 
     - name: Check for changes
       id: git-diff
       run: |
-        git diff --quiet && echo "No changes to commit" || echo "::set-output name=changes::true"
+        git diff --quiet && echo "No changes to commit" || echo "changes=true" >> $GITHUB_OUTPUT
       shell: bash
 
     # Commit changes (if any)
@@ -112,37 +111,37 @@ jobs:
         git config --global user.name "octavia-squidington-iii"
         git config --global user.email "contact@airbyte.com"
         git add .
-        git commit -m "Auto-commit `poetry lock` changes"
+        git commit -m "Auto-commit `uv lock` changes"
 
-    - name: Push changes to '(${{ steps.pr-info.outputs.repo }})'
+    - name: Push changes to '(${{ steps.vars.outputs.pr-source-repo-name-full }})'
       if: steps.git-diff.outputs.changes == 'true'
       run: |
-        git remote add contributor https://github.com/${{ steps.pr-info.outputs.repo }}.git
-        git push contributor HEAD:${{ steps.pr-info.outputs.branch }}
+        git remote add contributor https://github.com/${{ steps.vars.outputs.pr-source-repo-name-full }}.git
+        git push contributor HEAD:${{ steps.vars.outputs.pr-source-git-branch }}
 
     - name: Append success comment
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@v5
       if: steps.git-diff.outputs.changes == 'true'
       with:
         comment-id: ${{ steps.first-comment-action.outputs.comment-id }}
         reactions: hooray
         body: |
-          > ✅ `poetry lock` applied successfully.
+          > `uv lock` applied successfully.
 
     - name: Append success comment (no-op)
-      uses: peter-evans/create-or-update-comment@v4
-      if: steps.git-diff.outputs.changes != 'true' && steps.git-diff-2.outputs.changes != 'true'
+      uses: peter-evans/create-or-update-comment@v5
+      if: steps.git-diff.outputs.changes != 'true'
       with:
         comment-id: ${{ steps.first-comment-action.outputs.comment-id }}
         reactions: "+1"
         body: |
-          > 🟦 Job completed successfully (no changes).
+          > Job completed successfully (no changes).
 
     - name: Append failure comment
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@v5
       if: failure()
       with:
         comment-id: ${{ steps.first-comment-action.outputs.comment-id }}
         reactions: confused
         body: |
-          > ❌ Job failed.
+          > Job failed.

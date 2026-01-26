@@ -35,35 +35,33 @@ jobs:
     steps:
 
     # Custom steps to fetch the PR and checkout the code:
+    - name: Authenticate as GitHub App
+      uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
+      id: get-app-token
+      with:
+        owner: "airbytehq"
+        repositories: "PyAirbyte"
+        app-id: ${{ secrets.OCTAVIA_BOT_APP_ID }}
+        private-key: ${{ secrets.OCTAVIA_BOT_PRIVATE_KEY }}
     - name: Checkout Airbyte
-      uses: actions/checkout@v4
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       with:
         # Important that this is set so that CI checks are triggered again
         # Without this we would be forever waiting on required checks to pass
-        token: ${{ secrets.GH_PAT_APPROVINGTON_OCTAVIA }}
+        token: ${{ steps.get-app-token.outputs.token }}
 
     - name: Checkout PR (${{ github.event.inputs.pr }})
-      uses: dawidd6/action-checkout-pr@v1
+      uses: dawidd6/action-checkout-pr@a7598e18433a763b784f17d666372913d8bd4205 # v1.2.0
       with:
         pr: ${{ github.event.inputs.pr }}
 
-    - name: Get PR info
-      id: pr-info
-      run: |
-        PR_JSON=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.inputs.pr }})
-        echo "::set-output name=repo::$(echo "$PR_JSON" | jq -r .head.repo.full_name)"
-        echo "::set-output name=branch::$(echo "$PR_JSON" | jq -r .head.ref)"
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      shell: bash
-
-    - name: Create URL to the run output
+    - name: Resolve workflow variables
       id: vars
-      run: echo "run-url=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> $GITHUB_OUTPUT
+      uses: aaronsteers/resolve-ci-vars-action@2e56afab0344bbe03c047dfa39bae559d0291472 # v0.1.6
 
     - name: Append comment with job run link
       id: first-comment-action
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
       with:
         comment-id: ${{ github.event.inputs.comment-id }}
         issue-number: ${{ github.event.inputs.pr }}
@@ -78,31 +76,32 @@ jobs:
 
           [1]: ${{ steps.vars.outputs.run-url }}
 
-    - name: Set up Poetry
-      uses: Gr1N/setup-poetry@v9
+    - name: Install uv
+      uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904 # v7
       with:
-        poetry-version: "2.0.1"
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
+        version: "latest"
         python-version: ${{ matrix.python-version }}
-        cache: 'poetry'
-    - name: Install dependencies
-      run: poetry install
+    - name: Install dev dependencies
+      # We only need helper libraries
+      run: uv sync --group dev
 
     # Fix any lint or format issues
 
     - name: Auto-Fix Ruff Lint Issues
-      run: poetry run ruff check --fix . || true
+      run: uv run ruff check --fix . || true
     - name: Auto-Fix Ruff Format Issues
-      run: poetry run ruff format . || true
+      run: uv run ruff format . || true
 
     # Check for changes in git
 
     - name: Check for changes
       id: git-diff
       run: |
-        git diff --quiet && echo "No changes to commit" || echo "::set-output name=changes::true"
+        if git diff --quiet; then
+          echo "changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "changes=true" >> $GITHUB_OUTPUT
+        fi
       shell: bash
 
     # Commit changes (if any)
@@ -118,16 +117,20 @@ jobs:
     # Fix any further 'unsafe' lint issues in a separate commit
 
     - name: Auto-Fix Ruff Lint Issues (Unsafe)
-      run: poetry run ruff check --fix --unsafe-fixes . || true
+      run: uv run ruff check --fix --unsafe-fixes . || true
     - name: Auto-Fix Ruff Format Issues
-      run: poetry run ruff format . || true
+      run: uv run ruff format . || true
 
     # Check for changes in git (2nd time, for 'unsafe' lint fixes)
 
     - name: Check for changes ('unsafe' fixes)
       id: git-diff-2
       run: |
-        git diff --quiet && echo "No changes to commit" || echo "::set-output name=changes::true"
+        if git diff --quiet; then
+          echo "changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "changes=true" >> $GITHUB_OUTPUT
+        fi
       shell: bash
 
     - name: Commit 'unsafe' lint fixes
@@ -138,14 +141,14 @@ jobs:
         git add .
         git commit -m "Auto-fix lint issues (unsafe)"
 
-    - name: Push changes to '(${{ steps.pr-info.outputs.repo }})'
+    - name: Push changes to '(${{ steps.vars.outputs.pr-source-repo-name-full }})'
       if: steps.git-diff.outputs.changes == 'true' || steps.git-diff-2.outputs.changes == 'true'
       run: |
-        git remote add contributor https://github.com/${{ steps.pr-info.outputs.repo }}.git
-        git push contributor HEAD:${{ steps.pr-info.outputs.branch }}
+        git remote add contributor https://github.com/${{ steps.vars.outputs.pr-source-repo-name-full }}.git
+        git push contributor HEAD:${{ steps.vars.outputs.pr-source-git-branch }}
 
     - name: Append success comment
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
       if: steps.git-diff.outputs.changes == 'true' || steps.git-diff-2.outputs.changes == 'true'
       with:
         comment-id: ${{ steps.first-comment-action.outputs.comment-id }}
@@ -154,7 +157,7 @@ jobs:
           > ✅ Changes applied successfully.
 
     - name: Append success comment (no-op)
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
       if: steps.git-diff.outputs.changes != 'true' && steps.git-diff-2.outputs.changes != 'true'
       with:
         comment-id: ${{ steps.first-comment-action.outputs.comment-id }}
@@ -163,7 +166,7 @@ jobs:
           > 🟦 Job completed successfully (no changes).
 
     - name: Append failure comment
-      uses: peter-evans/create-or-update-comment@v4
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
       if: failure()
       with:
         comment-id: ${{ steps.first-comment-action.outputs.comment-id }}

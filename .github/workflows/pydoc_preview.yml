@@ -15,26 +15,23 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
-    - name: Set up Poetry
-      uses: Gr1N/setup-poetry@v9
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+    - name: Install uv
+      uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904 # v7
       with:
-        poetry-version: "2.0.1"
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
+        version: "latest"
         python-version: '3.10'
-        cache: 'poetry'
 
-    - name: Install dependencies
-      run: poetry install
+    - name: Install dev dependencies
+      # We only need helper libraries
+      run: uv sync --group dev
 
     - name: Generate documentation
       run: |
-        poetry run poe docs-generate
+        uv run poe docs-generate
 
     - name: Upload artifact
-      uses: actions/upload-pages-artifact@v3
+      uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
       with:
         # Upload entire repository
         path: 'docs/generated'

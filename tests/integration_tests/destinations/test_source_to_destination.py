@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 import pytest
 from airbyte import get_source
 from airbyte._executors.base import Executor
@@ -16,12 +19,23 @@ from airbyte.results import ReadResult, WriteResult
 from airbyte.shared.catalog_providers import CatalogProvider
 from airbyte.sources.base import Source
 from airbyte.strategies import WriteStrategy
+
 from airbyte_protocol.models import AirbyteMessage, AirbyteRecordMessage, Type
 
 
 @pytest.fixture
 def new_duckdb_destination_executor() -> Executor:
     """Return a new JSONL destination executor."""
+    local_mount_dir = Path.cwd() / "destination-duckdb"
+    if local_mount_dir.exists():
+        shutil.rmtree(local_mount_dir, ignore_errors=True)
+
+    # Create the directory with world-writable permissions
+    # This is needed for Docker volume mounts in CI environments where
+    # user namespace remapping may cause permission issues
+    local_mount_dir.mkdir(parents=True, exist_ok=True)
+    local_mount_dir.chmod(0o777)
+
     return get_connector_executor(
         name="destination-duckdb",
         docker_image="airbyte/destination-duckdb:latest",
@@ -35,15 +49,15 @@ def new_duckdb_destination(new_duckdb_destination_executor: Destination) -> Dest
     return Destination(
         name="destination-duckdb",
         config={
-            # This path is relative to the container:
-            "destination_path": "/local/temp/db.duckdb",
+            # This path is relative to the container's /local volume mount.
+            "destination_path": "/local/db.duckdb",
         },
         executor=new_duckdb_destination_executor,
     )
 
 
 @pytest.fixture
-def new_source_faker() -> Source:
+def new_source_faker(*, use_docker: str) -> Source:
     return get_source(
         "source-faker",
         config={
@@ -53,6 +67,7 @@ def new_source_faker() -> Source:
         },
         install_if_missing=True,
         streams=["products"],
+        docker_image=use_docker,
     )
 
 

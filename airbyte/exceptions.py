@@ -462,7 +462,7 @@ class AirbyteConnectionError(AirbyteError):
 
     @property
     def connection_url(self) -> str | None:
-        """The URL to the connection where the error occurred."""
+        """The web URL to the connection where the error occurred."""
         if self.workspace_url and self.connection_id:
             return f"{self.workspace_url}/connections/{self.connection_id}"
 
@@ -472,7 +472,7 @@ class AirbyteConnectionError(AirbyteError):
     def job_history_url(self) -> str | None:
         """The URL to the job history where the error occurred."""
         if self.connection_url:
-            return f"{self.connection_url}/job-history"
+            return f"{self.connection_url}/timeline"
 
         return None
 
@@ -488,6 +488,27 @@ class AirbyteConnectionError(AirbyteError):
 @dataclass
 class AirbyteConnectionSyncError(AirbyteConnectionError):
     """An error occurred while executing the remote Airbyte job."""
+
+
+@dataclass
+class AirbyteWorkspaceMismatchError(AirbyteError):
+    """Resource does not belong to the expected workspace.
+
+    This error is raised when a resource (connection, source, or destination) is fetched
+    from the API and the workspace ID in the response does not match the expected workspace.
+    """
+
+    resource_type: str | None = None
+    """The type of resource (e.g., 'connection', 'source', 'destination')."""
+
+    resource_id: str | None = None
+    """The ID of the resource that was fetched."""
+
+    expected_workspace_id: str | None = None
+    """The workspace ID that was expected."""
+
+    actual_workspace_id: str | None = None
+    """The workspace ID returned by the API."""
 
 
 @dataclass

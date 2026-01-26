@@ -98,8 +98,9 @@ __pypackages__/
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environment Vars & Secrets
 .env
+.envrc
 .env.local
 .venv
 venv/
@@ -117,7 +118,7 @@ venv.bak/
 # mkdocs documentation
 /site
 
-# mypy
+# Type checkers (mypy, pyrefly)
 .mypy_cache/
 .dmypy.json
 dmypy.json
